@@ -8,5 +8,6 @@ asyncpg
 alembic
 pgvector
 google-genai
+pyodbc
 pytest
 httpx
