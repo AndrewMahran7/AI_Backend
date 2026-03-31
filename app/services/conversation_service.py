@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.providers.embeddings.gemini_embeddings import GeminiEmbeddingProvider
 from app.providers.llm.gemini_provider import GeminiLLMProvider
 from app.repositories.conversation import ConversationRepository
+from app.repositories.record import RecordRepository
 from app.services.query_service import QueryService
 from app.services.retrieval_service import RetrievalService
 
@@ -89,25 +90,111 @@ class ConversationService:
                 "query_type": "fact",
             }
 
-        # 5. Store assistant message
+        # 5. Enrich sources with record metadata (type, source, preview)
+        enriched_sources = await self._enrich_sources(
+            result.get("sources", [])
+        )
+
+        # 6. Store assistant message
         assistant_msg = await self._repo.add_message(
             conversation_id=conversation_id,
             role="assistant",
             content=result.get("answer", ""),
-            sources=result.get("sources", []),
+            sources=enriched_sources,
             confidence=result.get("confidence", 0.0),
             notes=result.get("notes", ""),
             query_type=result.get("query_type", ""),
         )
 
-        # 6. Auto-title conversation if it's the first message
+        # 7. Auto-title conversation if it's the first message
         if conv.title == "New Chat" and content:
-            short_title = content[:80].strip()
-            if len(content) > 80:
-                short_title += "…"
-            await self._repo.update_conversation_title(conversation_id, short_title)
+            try:
+                generated_title = await self._generate_title(llm, content)
+                await self._repo.update_conversation_title(conversation_id, generated_title)
+            except Exception:
+                logger.warning("LLM title generation failed for %s, using fallback", conversation_id)
+                fallback = self._fallback_title(content)
+                await self._repo.update_conversation_title(conversation_id, fallback)
 
-        # 7. Touch conversation timestamp
+        # 8. Touch conversation timestamp
         await self._repo.touch_conversation(conversation_id)
 
         return user_msg, assistant_msg
+
+    # ── Source enrichment ────────────────────────────────────────────────
+
+    async def _enrich_sources(
+        self, raw_sources: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        """Look up record metadata and return enriched source dicts."""
+        if not raw_sources:
+            return []
+
+        repo = RecordRepository(self._session)
+        enriched: list[dict[str, str]] = []
+
+        for src in raw_sources:
+            rid_str = src.get("record_id", "")
+            if not rid_str:
+                enriched.append(src)
+                continue
+            try:
+                record = await repo.get_record_by_id(uuid.UUID(rid_str))
+            except (ValueError, Exception):
+                enriched.append(src)
+                continue
+
+            if record is None:
+                enriched.append(src)
+                continue
+
+            summary = record.summary
+            enriched.append({
+                "record_id": rid_str,
+                "title": src.get("title") or record.title,
+                "source_type": record.type,
+                "source": record.source,
+                "preview_text": summary.short_summary if summary else "",
+            })
+
+        return enriched
+
+    # ── Title helpers ─────────────────────────────────────────────────
+
+    _TITLE_PROMPT = (
+        "Generate a short conversation title (3-6 words) for this engineering query. "
+        "Rules:\n"
+        "- Exactly 3 to 6 words\n"
+        "- No punctuation at the end\n"
+        "- No filler words (the, a, an, is, what, how, can, etc.)\n"
+        "- Descriptive of the technical intent\n"
+        "- Title case\n"
+        "- Return ONLY the title, nothing else\n\n"
+        "Query: "
+    )
+
+    async def _generate_title(self, llm: GeminiLLMProvider, user_message: str) -> str:
+        """Ask the LLM for a concise conversation title."""
+        prompt = self._TITLE_PROMPT + user_message[:500]
+        raw = await llm.generate_text(prompt)
+        title = raw.strip().strip('"').strip("'").strip()
+        # Remove trailing punctuation
+        title = title.rstrip(".!?…")
+        # Enforce max length
+        if len(title) > 60:
+            title = " ".join(title.split()[:6])
+        if not title:
+            title = self._fallback_title(user_message)
+        return title
+
+    @staticmethod
+    def _fallback_title(content: str) -> str:
+        """Create a short title from the first few meaningful words."""
+        stopwords = {"the", "a", "an", "is", "are", "was", "were", "what", "how",
+                     "can", "do", "does", "i", "my", "me", "we", "our", "you",
+                     "your", "it", "its", "this", "that", "of", "in", "to", "for",
+                     "and", "or", "but", "with", "on", "at", "by", "be", "if"}
+        words = content.split()
+        meaningful = [w for w in words if w.lower().strip("?.,!") not in stopwords]
+        selected = meaningful[:5] if meaningful else words[:5]
+        return " ".join(selected)[:60].strip()

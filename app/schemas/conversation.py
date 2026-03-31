@@ -11,6 +11,9 @@ from pydantic import BaseModel, Field
 class SourceItem(BaseModel):
     record_id: str
     title: str
+    source_type: str = ""
+    source: str = ""
+    preview_text: str = ""
 
 
 # ── Messages ─────────────────────────────────────────────────────────────
