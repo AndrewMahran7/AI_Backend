@@ -36,6 +36,19 @@ class ConversationRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def search_conversations(
+        self, query: str, limit: int = 50, offset: int = 0
+    ) -> list[Conversation]:
+        stmt = (
+            select(Conversation)
+            .where(Conversation.title.ilike(f"%{query}%"))
+            .order_by(Conversation.updated_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_conversation(self, conversation_id: uuid.UUID) -> Conversation | None:
         stmt = (
             select(Conversation)
@@ -44,6 +57,13 @@ class ConversationRepository:
         )
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def delete_conversation(self, conversation_id: uuid.UUID) -> bool:
+        conv = await self._session.get(Conversation, conversation_id)
+        if conv is None:
+            return False
+        await self._session.delete(conv)
+        return True
 
     async def update_conversation_title(
         self, conversation_id: uuid.UUID, title: str

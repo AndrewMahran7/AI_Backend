@@ -1,6 +1,7 @@
 """Pydantic schemas for the ingestion endpoint."""
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -17,8 +18,20 @@ class IngestRequest(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    """Response returned by ``POST /ingest``."""
+    """Response returned by ``POST /ingest`` and ``POST /ingest/upload``."""
 
     record_id: uuid.UUID
     job_id: uuid.UUID
     status: str = "queued"
+
+
+class JobStatusResponse(BaseModel):
+    """Response for ``GET /jobs/{job_id}``."""
+
+    job_id: uuid.UUID
+    status: str
+    job_type: str
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    error: str | None = None

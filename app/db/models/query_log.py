@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -40,6 +40,18 @@ class QueryLog(Base):
         server_default=sa_text("'[]'::jsonb"),
     )
     duration_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    iterations: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=sa_text("1")
+    )
+    used_agentic_search: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    agentic_search_queries: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=sa_text("'[]'::jsonb"),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

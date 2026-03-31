@@ -21,7 +21,9 @@ class ChatResponse(BaseModel):
 
     answer: str
     sources: list[ChatSource] = Field(default_factory=list)
-    confidence: float = Field(ge=0.0, le=0.85)
+    confidence: float = Field(ge=0.0, le=1.0)
     notes: str = ""
     query_type: str = Field(default="fact", description="Classified query type (fact, summary, compare, list)")
+    iterations: int = Field(default=1, description="Number of retrieval iterations used")
+    used_agentic_search: bool = Field(default=False, description="Whether the model triggered additional retrieval")
 

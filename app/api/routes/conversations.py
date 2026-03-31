@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
@@ -41,10 +41,11 @@ async def create_conversation(
 async def list_conversations(
     limit: int = 50,
     offset: int = 0,
+    query: str | None = None,
     session: AsyncSession = Depends(get_db),
 ) -> list[ConversationOut]:
     svc = ConversationService(session)
-    convs = await svc.list_conversations(limit=limit, offset=offset)
+    convs = await svc.list_conversations(limit=limit, offset=offset, query=query)
     return [ConversationOut.model_validate(c) for c in convs]
 
 
@@ -62,6 +63,22 @@ async def get_messages(
     svc = ConversationService(session)
     msgs = await svc.get_messages(conversation_id, limit=limit, offset=offset)
     return [MessageOut.model_validate(m) for m in msgs]
+
+
+@router.delete(
+    "/{conversation_id}",
+    status_code=204,
+    summary="Delete a conversation",
+)
+async def delete_conversation(
+    conversation_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    svc = ConversationService(session)
+    deleted = await svc.delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

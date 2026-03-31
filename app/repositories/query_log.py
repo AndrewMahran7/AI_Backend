@@ -22,6 +22,9 @@ class QueryLogRepository:
         answer_confidence: float,
         sources: list[dict],
         duration_ms: float,
+        iterations: int = 1,
+        used_agentic_search: bool = False,
+        agentic_search_queries: list[str] | None = None,
     ) -> QueryLog:
         """Insert a new query log entry."""
         log = QueryLog(
@@ -33,6 +36,9 @@ class QueryLogRepository:
             answer_confidence=answer_confidence,
             sources=sources,
             duration_ms=duration_ms,
+            iterations=iterations,
+            used_agentic_search=used_agentic_search,
+            agentic_search_queries=agentic_search_queries or [],
         )
         self._session.add(log)
         await self._session.flush()

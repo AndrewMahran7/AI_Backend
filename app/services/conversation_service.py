@@ -25,11 +25,20 @@ class ConversationService:
     async def create_conversation(self, title: str = "New Chat"):
         return await self._repo.create_conversation(title=title)
 
-    async def list_conversations(self, limit: int = 50, offset: int = 0):
+    async def list_conversations(
+        self, limit: int = 50, offset: int = 0, query: str | None = None
+    ):
+        if query and query.strip():
+            return await self._repo.search_conversations(
+                query=query.strip(), limit=limit, offset=offset
+            )
         return await self._repo.list_conversations(limit=limit, offset=offset)
 
     async def get_conversation(self, conversation_id: uuid.UUID):
         return await self._repo.get_conversation(conversation_id)
+
+    async def delete_conversation(self, conversation_id: uuid.UUID) -> bool:
+        return await self._repo.delete_conversation(conversation_id)
 
     async def get_messages(
         self, conversation_id: uuid.UUID, limit: int = 100, offset: int = 0
@@ -39,26 +48,37 @@ class ConversationService:
         )
 
     async def send_message(self, conversation_id: uuid.UUID, content: str):
-        """Store user message, run RAG pipeline, store assistant response."""
+        """Store user message, run RAG pipeline with conversation history, store assistant response."""
         # 1. Verify conversation exists
         conv = await self._repo.get_conversation(conversation_id)
         if conv is None:
             raise ValueError(f"Conversation {conversation_id} not found")
 
-        # 2. Store user message
+        # 2. Fetch recent messages for conversation history (BEFORE storing new message)
+        recent_messages = await self._repo.get_messages(
+            conversation_id, limit=10
+        )
+        conversation_history = [
+            {"role": m.role, "content": m.content}
+            for m in recent_messages
+        ]
+
+        # 3. Store user message
         user_msg = await self._repo.add_message(
             conversation_id=conversation_id,
             role="user",
             content=content,
         )
 
-        # 3. Run the query pipeline
+        # 4. Run the query pipeline with conversation history
         try:
             llm = GeminiLLMProvider()
             embeddings = GeminiEmbeddingProvider()
             retrieval = RetrievalService(session=self._session, embeddings=embeddings)
             query_svc = QueryService(llm=llm, retrieval=retrieval, session=self._session)
-            result: dict[str, Any] = await query_svc.answer_query(content)
+            result: dict[str, Any] = await query_svc.answer_query(
+                content, conversation_history=conversation_history
+            )
         except Exception:
             logger.exception("Query pipeline failed for conversation %s", conversation_id)
             result = {
@@ -69,7 +89,7 @@ class ConversationService:
                 "query_type": "fact",
             }
 
-        # 4. Store assistant message
+        # 5. Store assistant message
         assistant_msg = await self._repo.add_message(
             conversation_id=conversation_id,
             role="assistant",
@@ -80,14 +100,14 @@ class ConversationService:
             query_type=result.get("query_type", ""),
         )
 
-        # 5. Auto-title conversation if it's the first message
+        # 6. Auto-title conversation if it's the first message
         if conv.title == "New Chat" and content:
             short_title = content[:80].strip()
             if len(content) > 80:
                 short_title += "…"
             await self._repo.update_conversation_title(conversation_id, short_title)
 
-        # 6. Touch conversation timestamp
+        # 7. Touch conversation timestamp
         await self._repo.touch_conversation(conversation_id)
 
         return user_msg, assistant_msg

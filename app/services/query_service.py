@@ -38,13 +38,20 @@ _STYLE_INSTRUCTIONS: dict[str, str] = {
 
 _QUERY_PROMPT = """\
 You are an AI knowledge assistant. Answer the user's question using ONLY the \
-context provided below. Do NOT use prior knowledge. If the context does not \
-contain enough information to answer, say "I don't have enough information to \
-answer this question."
+context provided below. Do NOT use prior knowledge.
+
+IMPORTANT – AGENTIC RETRIEVAL:
+If the provided context does NOT contain enough information to fully answer the \
+question, you MUST NOT say "I don't have enough information". Instead, request \
+additional data by returning intent="search" with specific search queries.
+
+Only return intent="search" when you are missing critical data needed to answer \
+(e.g., comparison data for a product not in context, missing specifications). \
+If you can provide a reasonable answer from the context, return intent="answer".
 
 QUERY TYPE: {query_type}
 STYLE: {style}
-
+{history_section}
 CONTEXT:
 {context}
 
@@ -55,7 +62,9 @@ Return your response as a JSON object with EXACTLY these keys – no extra keys,
 no markdown fences, no explanation outside the JSON:
 
 {{
-  "answer": "<your detailed answer>",
+  "intent": "<answer OR search>",
+  "search_queries": ["<specific search query 1>", "<specific search query 2>"],
+  "answer": "<your detailed answer or empty string if intent is search>",
   "sources": [
     {{"record_id": "<id>", "title": "<title>"}}
   ],
@@ -64,9 +73,13 @@ no markdown fences, no explanation outside the JSON:
 }}
 
 Rules:
+- "intent": MUST be either "answer" or "search".
+- "search_queries": 1–3 specific search queries when intent="search"; empty list when intent="answer".
+  Be specific in your search queries (e.g., "N-channel MOSFET comparison 30V low RDS(on)" NOT "more information").
 - "answer": comprehensive answer grounded in the provided context. Follow the STYLE instructions above.
-- "sources": list every record you referenced (deduplicate by record_id).
-- "confidence": your confidence that the answer is correct (0.0–1.0).
+  Empty string "" when intent="search".
+- "sources": list every record you referenced (deduplicate by record_id). Empty list when intent="search".
+- "confidence": your confidence that the answer is correct (0.0–1.0). 0.0 when intent="search".
 - "notes": brief note about data quality or gaps; empty string if none.
 - Return ONLY valid JSON.
 """
@@ -74,6 +87,17 @@ Rules:
 _MAX_CONFIDENCE = 0.85
 _LOW_CONFIDENCE_THRESHOLD = 0.6
 _MAX_SOURCES = 3
+_MAX_RETRIEVAL_ITERATIONS = 2
+_MAX_CONTEXT_CHUNKS = 15
+_MAX_HISTORY_MESSAGES = 10
+_MAX_HISTORY_CHAR_BUDGET = 2000
+
+_HISTORY_HEADER = """\
+CONVERSATION HISTORY (use this to understand follow-up questions and references \
+to previous messages. Always ground your answers in the CONTEXT section below, \
+not in conversation history):
+{history}
+"""
 
 # Weak hedge phrases to strip from answers (deterministic, no LLM call)
 _WEAK_PHRASES: list[re.Pattern[str]] = [
@@ -109,6 +133,13 @@ _LLM_ERROR_RESPONSE: dict[str, Any] = {
     "sources": [],
     "confidence": 0.0,
     "notes": "The language model was unable to produce a valid response.",
+}
+
+_FAILSAFE_RESPONSE: dict[str, Any] = {
+    "answer": "Limited data available. The comparison or answer is incomplete.",
+    "sources": [],
+    "confidence": 0.3,
+    "notes": "System attempted additional retrieval but the dataset is limited.",
 }
 
 
@@ -178,8 +209,18 @@ class QueryService:
         self._classifier = QueryClassifier(llm)
         self._logging = QueryLoggingService(session)
 
-    async def answer_query(self, query: str, top_k: int = 6) -> dict[str, Any]:
-        """Classify → hybrid-search → rerank → LLM answer → log.
+    async def answer_query(
+        self,
+        query: str,
+        top_k: int = 6,
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Classify → hybrid-search → rerank → LLM answer (with agentic retrieval loop) → log.
+
+        The LLM may return ``intent="search"`` with additional search queries
+        instead of an immediate answer.  This triggers up to
+        ``_MAX_RETRIEVAL_ITERATIONS`` additional retrieval rounds before
+        forcing a final answer.
 
         Parameters
         ----------
@@ -187,11 +228,15 @@ class QueryService:
             The user's natural-language question.
         top_k:
             Number of chunks to retrieve per search path.
+        conversation_history:
+            Optional list of ``{"role": ..., "content": ...}`` dicts
+            representing recent messages in the conversation for continuity.
 
         Returns
         -------
         dict
-            ``{"answer", "sources", "confidence", "notes", "query_type"}``
+            ``{"answer", "sources", "confidence", "notes", "query_type",
+              "iterations", "used_agentic_search"}``
         """
         start_time = time.perf_counter()
 
@@ -204,7 +249,7 @@ class QueryService:
             classification["confidence"],
         )
 
-        # 2 – Hybrid retrieval
+        # 2 – Initial hybrid retrieval
         results = await self._retrieval.hybrid_search(
             query, chunk_top_k=top_k, summary_top_k=max(3, top_k // 2)
         )
@@ -218,41 +263,119 @@ class QueryService:
                 answer_result=_NO_RESULTS_RESPONSE,
                 start_time=start_time,
             )
-            return {**_NO_RESULTS_RESPONSE, "query_type": query_type}
+            return {
+                **_NO_RESULTS_RESPONSE,
+                "query_type": query_type,
+                "iterations": 1,
+                "used_agentic_search": False,
+            }
 
         # 3 – Rerank based on classification
         results = RetrievalService.rerank_results(results, query_type=query_type)
 
-        # 4 – Build context string
-        context = self._build_context(results)
+        # 3b – Build conversation history section (computed once)
+        history_section = self._format_history(conversation_history or [])
 
-        # 5 – Call LLM with type-adapted prompt
-        style = _STYLE_INSTRUCTIONS.get(query_type, _STYLE_INSTRUCTIONS["fact"])
-        prompt = _QUERY_PROMPT.format(
-            query_type=query_type,
-            style=style,
-            context=context,
-            question=query,
-        )
+        # ── Agentic retrieval loop ───────────────────────────────────────
+        iteration = 0
+        used_agentic_search = False
+        all_search_queries: list[str] = []
+        # Accumulate all results across iterations (keyed by record_id)
+        accumulated: dict[str, dict[str, Any]] = {
+            r["record_id"]: r for r in results
+        }
 
-        try:
-            raw = await self._llm.generate_text(prompt)
-        except Exception:
-            logger.exception("LLM call failed for query: %s", query[:120])
-            await self._logging.log_query(
-                query=query,
-                classification=classification,
-                retrieved_record_ids=[r["record_id"] for r in results],
-                answer_result=_LLM_ERROR_RESPONSE,
-                start_time=start_time,
+        while iteration < _MAX_RETRIEVAL_ITERATIONS + 1:  # +1 includes initial
+            iteration += 1
+
+            # Build context from accumulated results (capped)
+            current_results = sorted(
+                accumulated.values(), key=lambda x: x["score"], reverse=True
+            )[:_MAX_CONTEXT_CHUNKS]
+            context = self._build_context(current_results)
+
+            # Call LLM
+            style = _STYLE_INSTRUCTIONS.get(query_type, _STYLE_INSTRUCTIONS["fact"])
+            prompt = _QUERY_PROMPT.format(
+                query_type=query_type,
+                style=style,
+                history_section=history_section,
+                context=context,
+                question=query,
             )
-            return {**_LLM_ERROR_RESPONSE, "query_type": query_type}
 
-        # 6 – Parse response
-        answer_result = self._parse_response(raw, results)
+            try:
+                raw = await self._llm.generate_text(prompt)
+            except Exception:
+                logger.exception("LLM call failed for query: %s", query[:120])
+                await self._logging.log_query(
+                    query=query,
+                    classification=classification,
+                    retrieved_record_ids=[r["record_id"] for r in current_results],
+                    answer_result=_LLM_ERROR_RESPONSE,
+                    start_time=start_time,
+                    iterations=iteration,
+                    used_agentic_search=used_agentic_search,
+                    agentic_search_queries=all_search_queries,
+                )
+                return {
+                    **_LLM_ERROR_RESPONSE,
+                    "query_type": query_type,
+                    "iterations": iteration,
+                    "used_agentic_search": used_agentic_search,
+                }
+
+            # Parse response
+            answer_result = self._parse_response(raw, current_results)
+            intent = answer_result.pop("intent", "answer")
+            search_queries = answer_result.pop("search_queries", [])
+
+            # If model wants to answer, or we've exhausted iterations → break
+            if intent == "answer" or iteration > _MAX_RETRIEVAL_ITERATIONS:
+                if intent == "search" and iteration > _MAX_RETRIEVAL_ITERATIONS:
+                    # Exhausted iterations – use failsafe
+                    logger.warning(
+                        "Agentic retrieval exhausted %d iterations; returning failsafe.",
+                        _MAX_RETRIEVAL_ITERATIONS,
+                    )
+                    answer_result = {**_FAILSAFE_RESPONSE}
+                break
+
+            # intent == "search": perform additional retrieval
+            used_agentic_search = True
+            all_search_queries.extend(search_queries)
+            logger.info(
+                "Agentic retrieval iteration %d – model requested search: %s",
+                iteration,
+                search_queries,
+            )
+
+            # Retrieve for each search query and merge
+            for sq in search_queries[:3]:  # cap at 3 queries
+                new_results = await self._retrieval.hybrid_search(
+                    sq,
+                    chunk_top_k=top_k,
+                    summary_top_k=max(3, top_k // 2),
+                )
+                new_results = RetrievalService.rerank_results(
+                    new_results, query_type=query_type
+                )
+                for nr in new_results:
+                    rid = nr["record_id"]
+                    if rid not in accumulated or nr["score"] > accumulated[rid]["score"]:
+                        accumulated[rid] = nr
+
+        # ── End of retrieval loop ────────────────────────────────────────
+
+        final_results = sorted(
+            accumulated.values(), key=lambda x: x["score"], reverse=True
+        )[:_MAX_CONTEXT_CHUNKS]
+
         answer_result["query_type"] = query_type
+        answer_result["iterations"] = iteration
+        answer_result["used_agentic_search"] = used_agentic_search
 
-        # 7 – Post-process (deterministic – no LLM calls)
+        # Post-process (deterministic – no LLM calls)
         answer_result["confidence"] = _clamp_confidence(answer_result["confidence"])
         answer_result["sources"] = _filter_sources(answer_result["sources"])
         answer_result["answer"] = _refine_answer(answer_result["answer"], query_type)
@@ -265,18 +388,48 @@ class QueryService:
                 + " Low confidence – the retrieved context may not be sufficient."
             ).strip()
 
-        # 8 – Log the interaction
+        # Log the interaction
         await self._logging.log_query(
             query=query,
             classification=classification,
-            retrieved_record_ids=[r["record_id"] for r in results],
+            retrieved_record_ids=[r["record_id"] for r in final_results],
             answer_result=answer_result,
             start_time=start_time,
+            iterations=iteration,
+            used_agentic_search=used_agentic_search,
+            agentic_search_queries=all_search_queries,
         )
 
         return answer_result
 
     # ── Internal helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_history(history: list[dict[str, str]]) -> str:
+        """Format conversation history into a prompt section.
+
+        Returns an empty string when there is no history, so the prompt
+        template collapses cleanly.
+        """
+        if not history:
+            return ""
+
+        lines: list[str] = []
+        total_chars = 0
+        for msg in history[-_MAX_HISTORY_MESSAGES:]:
+            role = msg.get("role", "user").capitalize()
+            content = msg.get("content", "")
+            if len(content) > 300:
+                content = content[:300] + "…"
+            line = f"{role}: {content}"
+            total_chars += len(line)
+            if total_chars > _MAX_HISTORY_CHAR_BUDGET:
+                break
+            lines.append(line)
+
+        if not lines:
+            return ""
+        return _HISTORY_HEADER.format(history="\n".join(lines))
 
     @staticmethod
     def _build_context(results: list[dict[str, Any]]) -> str:
@@ -296,7 +449,10 @@ class QueryService:
         raw: str,
         results: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Parse the LLM JSON output with safe fallback."""
+        """Parse the LLM JSON output with safe fallback.
+
+        Now supports ``intent`` and ``search_queries`` keys for agentic retrieval.
+        """
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
@@ -315,11 +471,25 @@ class QueryService:
                     seen.add(r["record_id"])
                     sources.append({"record_id": r["record_id"], "title": r["title"]})
             return {
+                "intent": "answer",
+                "search_queries": [],
                 "answer": raw,
                 "sources": sources,
                 "confidence": 0.5,
                 "notes": "The model response could not be parsed as structured JSON.",
             }
+
+        # Extract agentic fields
+        intent = parsed.get("intent", "answer")
+        search_queries = parsed.get("search_queries", [])
+
+        # Validate intent
+        if intent not in ("answer", "search"):
+            intent = "answer"
+        # Validate search_queries
+        if not isinstance(search_queries, list):
+            search_queries = []
+        search_queries = [q for q in search_queries if isinstance(q, str) and q.strip()][:3]
 
         # Ensure all required keys are present.
         seen_ids: set[str] = set()
@@ -333,6 +503,8 @@ class QueryService:
                 )
 
         return {
+            "intent": intent,
+            "search_queries": search_queries,
             "answer": parsed.get("answer", ""),
             "sources": deduped_sources,
             "confidence": float(parsed.get("confidence", 0.0)),
